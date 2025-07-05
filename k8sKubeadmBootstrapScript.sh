@@ -31,6 +31,15 @@ function validate_ip {
     fi
 }
 
+# Function to validate CIDR format
+function validate_cidr {
+    if ! [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]{1,2}$ ]]; then
+        print_color "red" "Error: Invalid CIDR format. Expected format is like 192.168.1.0/24."
+        exit 1
+    fi
+}
+
+
 # --- Collect User Input ---
 
 print_color "blue" "--- Kubernetes Cluster Configuration ---"
@@ -54,7 +63,7 @@ declare -a MASTER_ADMIN_USERS
 
 for (( i=1; i<=MASTER_COUNT; i++ )); do
     print_color "green" "\nEnter details for Master Node #$i:"
-    read -p "  IP Address: " ip
+    read -p "  IP Address (for primary cluster communication): " ip
     validate_ip "$ip"
     MASTER_IPS+=("$ip")
 
@@ -80,7 +89,7 @@ declare -a WORKER_ADMIN_USERS
 
 for (( i=1; i<=WORKER_COUNT; i++ )); do
     print_color "green" "\nEnter details for Worker Node #$i:"
-    read -p "  IP Address: " ip
+    read -p "  IP Address (for primary cluster communication): " ip
     validate_ip "$ip"
     WORKER_IPS+=("$ip")
 
@@ -93,6 +102,32 @@ for (( i=1; i<=WORKER_COUNT; i++ )); do
     read -p "  Administrative Username: " user
     WORKER_ADMIN_USERS+=("$user")
 done
+
+# --- Secondary Network (Multus) Configuration ---
+print_color "blue" "\n--- Secondary Network Configuration (Multus) ---"
+read -p "Do you want to configure secondary networks for your pods? (y/n): " CONFIGURE_MULTUS
+declare -a NET_ATTACH_NAMES
+declare -a NET_ATTACH_INTERFACES
+declare -a NET_ATTACH_SUBNETS
+
+if [[ "$CONFIGURE_MULTUS" == "y" || "$CONFIGURE_MULTUS" == "Y" ]]; then
+    read -p "How many secondary networks do you want to add? " SECONDARY_NET_COUNT
+    validate_integer "$SECONDARY_NET_COUNT"
+
+    for (( i=1; i<=SECONDARY_NET_COUNT; i++ )); do
+        print_color "green" "\nEnter details for Secondary Network #$i:"
+        read -p "  Network Name (e.g., iot-net, storage-net): " net_name
+        NET_ATTACH_NAMES+=("$net_name")
+
+        read -p "  Physical Interface Name on Nodes (e.g., eth1, enp0s8): " net_interface
+        NET_ATTACH_INTERFACES+=("$net_interface")
+
+        read -p "  Subnet for this network (e.g., 192.168.100.0/24): " net_subnet
+        validate_cidr "$net_subnet"
+        NET_ATTACH_SUBNETS+=("$net_subnet")
+    done
+fi
+
 
 # --- Installation Script ---
 
@@ -205,6 +240,7 @@ done
 # --- Initialize Cluster on the First Master ---
 print_color "blue" "\n--- Initializing Kubernetes Cluster on ${MASTER_HOSTNAMES[0]} ---"
 SSH_CMD_FIRST_MASTER=$(get_ssh_cmd "$FIRST_MASTER_USER" "$FIRST_MASTER_IP" "$FIRST_MASTER_KEY")
+SCP_CMD_FIRST_MASTER=$(get_scp_cmd "$FIRST_MASTER_USER" "$FIRST_MASTER_IP" "$FIRST_MASTER_KEY")
 
 # Initialize the cluster
 # We use --pod-network-cidr required for most CNI plugins like Calico or Flannel
@@ -220,7 +256,7 @@ $SSH_CMD_FIRST_MASTER "sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config"
 # Get the join commands
 print_color "blue" "Retrieving join commands from the first master..."
 MASTER_JOIN_CMD=$($SSH_CMD_FIRST_MASTER "kubeadm token create --print-join-command")
-WORKER_JOIN_CMD=$($SSH_CMD_FIRST_MASTER "kubeadm token create --print-join-command") # A separate token for workers is good practice
+WORKER_JOIN_CMD=$($SSH_CMD_FIRST_MASTER "kubeadm token create --print-join-command")
 
 # --- Join Additional Master Nodes ---
 if [ "$MASTER_COUNT" -gt 1 ]; then
@@ -261,9 +297,51 @@ done
 
 
 # --- Final Steps ---
-print_color "blue" "\n--- Applying CNI (Calico) ---"
-# Note: You can replace this with Flannel or another CNI if you prefer.
+print_color "blue" "\n--- Applying Primary CNI (Calico) ---"
 $SSH_CMD_FIRST_MASTER "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml"
+
+# --- Deploy Multus and Secondary Networks ---
+if [[ "$CONFIGURE_MULTUS" == "y" || "$CONFIGURE_MULTUS" == "Y" ]]; then
+    print_color "blue" "\n--- Applying Multus CNI ---"
+    $SSH_CMD_FIRST_MASTER "kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset-thick.yml"
+
+    print_color "blue" "\n--- Creating Secondary Network Attachments ---"
+    for (( i=0; i<SECONDARY_NET_COUNT; i++ )); do
+        NET_NAME=${NET_ATTACH_NAMES[$i]}
+        NET_INTERFACE=${NET_ATTACH_INTERFACES[$i]}
+        NET_SUBNET=${NET_ATTACH_SUBNETS[$i]}
+        
+        print_color "green" "Creating NetworkAttachmentDefinition for '${NET_NAME}'"
+
+        # Create the NetworkAttachmentDefinition YAML locally
+        cat <<EOF > /tmp/net-attach-${NET_NAME}.yaml
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: ${NET_NAME}
+spec:
+  config: '{
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "${NET_INTERFACE}",
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "${NET_SUBNET}"
+      }
+    }'
+EOF
+        # Copy the YAML to the master node
+        $SCP_CMD_FIRST_MASTER /tmp/net-attach-${NET_NAME}.yaml ${FIRST_MASTER_USER}@${FIRST_MASTER_IP}:/tmp/
+
+        # Apply the YAML on the master node
+        $SSH_CMD_FIRST_MASTER "kubectl apply -f /tmp/net-attach-${NET_NAME}.yaml"
+
+        # Clean up local and remote temp files
+        rm /tmp/net-attach-${NET_NAME}.yaml
+        $SSH_CMD_FIRST_MASTER "rm /tmp/net-attach-${NET_NAME}.yaml"
+    done
+fi
 
 
 # --- Cleanup ---
@@ -273,3 +351,23 @@ print_color "green" "\n🎉 Kubernetes cluster '${CLUSTER_NAME}' has been create
 print_color "green" "You can now access your cluster by SSHing into the first master node:"
 print_color "green" "  ${SSH_CMD_FIRST_MASTER}"
 print_color "green" "Once logged in, you can run 'kubectl get nodes' to see the status of your cluster."
+
+if [[ "$CONFIGURE_MULTUS" == "y" || "$CONFIGURE_MULTUS" == "Y" ]]; then
+    print_color "blue" "\n--- How to Use Secondary Networks ---"
+    echo "To attach a pod to a secondary network, add an annotation to your pod's metadata."
+    echo "Example for a pod using the '${NET_ATTACH_NAMES[0]}' network:"
+    echo ""
+    echo "apiVersion: v1"
+    echo "kind: Pod"
+    echo "metadata:"
+    echo "  name: sample-pod"
+    echo "  annotations:"
+    echo "    k8s.v1.cni.cncf.io/networks: ${NET_ATTACH_NAMES[0]}"
+    echo "spec:"
+    echo "  containers:"
+    echo "  - name: sample-container"
+    echo "    image: busybox"
+    echo "    command: ['/bin/sh', '-c', 'sleep 3600']"
+    echo ""
+    echo "After creating the pod, you can run 'kubectl exec sample-pod -- ip a' to see the multiple interfaces."
+fi
